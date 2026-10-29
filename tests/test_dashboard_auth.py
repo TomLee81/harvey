@@ -599,13 +599,25 @@ def test_readable_existing_token_is_refused(tmp_path):
     assert path.read_text() == "A" * 43  # left for the operator to inspect
 
 
-@POSIX
 def test_symlinked_token_is_refused(tmp_path):
+    """Not @POSIX: dashboard_auth._read_token's symlink check
+    (os.path.islink) explicitly runs on Windows too (P9V), unlike the
+    owner/mode-bits/link-count checks the other tests in this cluster cover,
+    which really are POSIX-only. Skipped, not weakened, if this account
+    can't create a symlink at all in this environment (no Developer Mode,
+    not elevated) -- that's a capability limit of the job, not of the
+    assertion."""
     real = tmp_path / "real-token"
     real.write_text("B" * 43)
     os.chmod(real, 0o600)
     path = tmp_path / "dashboard-token"
-    path.symlink_to(real)
+    try:
+        path.symlink_to(real)
+    except OSError as e:
+        if os.name == "nt" and getattr(e, "winerror", None) == 1314:
+            pytest.skip("this account can't create a symlink here (no Developer "
+                        "Mode, not elevated) -- an environment limit, not a code issue")
+        raise
     _expect_locked(path, "symbolic link")
 
 
@@ -645,6 +657,80 @@ def test_non_regular_token_paths_are_refused(tmp_path):
     fifo = tmp_path / "fifo-token"
     os.mkfifo(fifo, 0o600)
     _expect_locked(fifo, "not a regular file")  # and doesn't hang
+
+
+_ACL_READ_TOKENS = {"F", "M", "RX", "R", "W", "GR", "GA", "GE", "GW", "RD", "REA", "RA"}
+_ACL_WATCH_PRINCIPALS = ("Everyone", "BUILTIN\\Users", "NT AUTHORITY\\Authenticated Users")
+_ACL_IGNORE_GROUPS = {"DENY", "OI", "CI", "IO", "NP", "I"}
+
+
+def _icacls_aces(path):
+    """[(principal, flags_blob)] for every access-control entry icacls
+    prints for path, or None if nothing in its output looked like one (the
+    caller fails loudly on None rather than treating "couldn't parse" as
+    "nothing to report"). icacls's own first line repeats the file path
+    before the first entry, which is stripped before matching."""
+    out = subprocess.run(["icacls", str(path)], capture_output=True, text=True, errors="replace")
+    if out.returncode != 0:
+        return None
+    path_str = str(path)
+    aces = []
+    for i, line in enumerate(out.stdout.splitlines()):
+        stripped = line.strip()
+        if i == 0 and stripped.startswith(path_str):
+            stripped = stripped[len(path_str):].strip()
+        m = re.search(r"([^:]+):((?:\([^)]*\))+)\s*$", stripped)
+        if m:
+            aces.append((m.group(1).strip(), m.group(2)))
+    return aces or None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs only")
+def test_windows_token_acl_has_no_broad_read_grant(tmp_path):
+    """Harvey sets no Windows ACL of its own -- dashboard_auth.py's module
+    docstring and README.md's "Windows:" note both say it relies entirely on
+    whatever ACL this machine's own folder inheritance already grants (P9V).
+    This test does NOT prove Harvey enforces anything; it only records,
+    for the job it runs on, whether a token file freshly created through
+    the real load_or_create_token() path ends up with a direct ALLOW access
+    -control entry -- as icacls lists it, inherited or explicit -- granting
+    a read-capable right to one of three broad, well-known principals:
+    Everyone, BUILTIN\\Users, or NT AUTHORITY\\Authenticated Users.
+
+    A DENY entry for one of these is never treated as proof nothing else
+    grants access (each entry is judged on its own). Principals are matched
+    by their literal English name only: GitHub-hosted Windows runners are
+    documented EN-US, but a differently-localized machine could rename
+    these principals, which would make this check miss a real grant (a
+    false negative, not a false positive -- a documented limitation, not
+    one this test can close without a structured ACL API). If icacls's
+    output can't be parsed into any recognisable access-control entries at
+    all, this fails with a diagnostic rather than passing silently."""
+    path = tmp_path / "dashboard-token"
+    auth.load_or_create_token(path)
+    aces = _icacls_aces(path)
+    assert aces is not None, (
+        f"icacls produced no parseable access-control entries for {path} "
+        "-- can't verify its ACL on this job")
+    problems = []
+    for principal, flags_blob in aces:
+        groups = re.findall(r"\(([^)]*)\)", flags_blob)
+        if any(g.upper() == "DENY" for g in groups):
+            continue  # a deny here says nothing about any other entry
+        perms = set()
+        for g in groups:
+            if g.upper() in _ACL_IGNORE_GROUPS:
+                continue
+            perms.update(tok.strip().upper() for tok in g.split(","))
+        if not (perms & _ACL_READ_TOKENS):
+            continue
+        if any(principal.lower() == watched.lower() for watched in _ACL_WATCH_PRINCIPALS):
+            problems.append(f"{principal}:{flags_blob}")
+    assert not problems, (
+        f"{path} grants read access to a broad principal via icacls: {problems} "
+        "-- Harvey sets no ACL of its own and relies on inherited folder "
+        "permissions (see dashboard_auth.py and README.md); that reliance "
+        "did not hold on this job")
 
 
 @POSIX
